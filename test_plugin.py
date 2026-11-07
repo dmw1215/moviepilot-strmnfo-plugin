@@ -267,7 +267,7 @@ mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 StrmNfo = mod.StrmNfo
 check("插件名", StrmNfo.plugin_name, "STRM媒体信息补全")
-check("插件版本", StrmNfo.plugin_version, "1.0.3")
+check("插件版本", StrmNfo.plugin_version, "1.0.4")
 
 plugin = StrmNfo()
 plugin.init_plugin({
@@ -394,7 +394,7 @@ with tempfile.TemporaryDirectory() as tmp:
 print("== 5. package.v3.json ==")
 pkg = json.loads((Path(__file__).resolve().parent / "package.v3.json").read_text(encoding="utf-8"))
 check("清单含StrmNfo", "StrmNfo" in pkg, True)
-check("清单版本", pkg["StrmNfo"]["version"], "1.0.3")
+check("清单版本", pkg["StrmNfo"]["version"], "1.0.4")
 
 # ---------------- 7. v1.0.1 回归：死锁、stop_service、原子写入 ----------------
 print("== 7. v1.0.1 回归 ==")
