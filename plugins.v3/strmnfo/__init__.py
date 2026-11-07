@@ -60,7 +60,7 @@ class StrmNfo(_PluginBase):
     # 插件图标
     plugin_icon = "scraper.svg"
     # 插件版本
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     # 插件标签
     plugin_label = "媒体库"
     # 插件作者
