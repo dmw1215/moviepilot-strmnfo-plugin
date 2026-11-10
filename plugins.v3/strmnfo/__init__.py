@@ -42,12 +42,13 @@ from app.sdk.logging import logger
 # 也可能是单文件 spec 加载（无包上下文），两种都试，失败则降级为不可用
 # （插件仍能加载，触发时记日志，不让整个插件起不来）。
 try:
-    from .nfo import generate_nfo_for_strm
+    from .nfo import generate_nfo_for_strm, nfo_has_probe_fields
 except ImportError:  # pragma: no cover - 取决于宿主加载方式
     try:
-        from nfo import generate_nfo_for_strm
+        from nfo import generate_nfo_for_strm, nfo_has_probe_fields
     except ImportError:
         generate_nfo_for_strm = None
+        nfo_has_probe_fields = None
 
 
 class StrmNfo(_PluginBase):
@@ -56,11 +57,11 @@ class StrmNfo(_PluginBase):
     # 插件名称
     plugin_name = "STRM媒体信息补全"
     # 插件描述
-    plugin_desc = "整理入库后自动从 .strm 文件名生成 .strm.nfo（分辨率/编码/HDR/音频/字幕），供 Emby 的 STRM Probe NFO 插件读取，让媒体播放器显示媒体信息；全程不访问云盘。"
+    plugin_desc = "整理入库后自动从 .strm 文件名生成 .strm.nfo（分辨率/编码/HDR/音频/字幕），供 Emby 的 STRM Probe NFO 插件读取，让媒体播放器显示媒体信息；默认只读文件名、不访问云盘，可选探测模式用 ffprobe 取真实参数（每文件夹只探一集）。"
     # 插件图标
     plugin_icon = "scraper.svg"
     # 插件版本
-    plugin_version = "1.0.4"
+    plugin_version = "1.1.3"
     # 插件标签
     plugin_label = "媒体库"
     # 插件作者
@@ -81,10 +82,23 @@ class StrmNfo(_PluginBase):
     _force: bool = False
     _max_per_run: int = 500
     _notify: bool = False
+    # 探测模式：读 .strm 里的 URL，只拉头部用 ffprobe 取真实参数
+    _probe: bool = False
+    _probe_timeout: int = 25
+    _probe_limit: int = 200
+    # 每文件夹只探测一个（每剧一集）：同一文件夹里只探第一个需要生成的文件，
+    # 其余同文件夹文件走文件名模式，避免整库探测的流量和时间
+    _probe_per_folder: bool = True
+    # 只识别文件名：打开后完全不探测、不发任何网络请求，全部走文件名模式；
+    # 适合 .strm 链接打不开、或者不想让插件访问任何服务的人。
+    # 优先级最高：打开时 probe 开关被忽略。
+    _filename_only: bool = False
 
     # ---- 运行时状态 ----
     _executor: Optional[ThreadPoolExecutor] = None
     _scheduler: Optional[BackgroundScheduler] = None
+    # 本轮扫描里已经探测过的文件夹（每轮扫描/每批事件开始时清空）
+    _probed_folders: set = set()
     # 扫描互斥锁。必须是 RLock（可重入）：_scan_with_trigger 持锁调用
     # _do_scan，扫描中 _process_one -> _record_failure 与结尾的 _save_run
     # 会在同一线程里再次加锁；用普通 Lock 会在第一次扫描结束时就死锁。
@@ -105,6 +119,12 @@ class StrmNfo(_PluginBase):
         self._force = bool(config.get("force"))
         self._max_per_run = self._safe_int(config.get("max_per_run"), 500)
         self._notify = bool(config.get("notify"))
+        self._probe = bool(config.get("probe"))
+        self._probe_timeout = self._safe_int(config.get("probe_timeout"), 25)
+        self._probe_limit = self._safe_int(config.get("probe_limit"), 200)
+        self._probe_per_folder = bool(config.get("probe_per_folder", True))
+        self._filename_only = bool(config.get("filename_only"))
+        self._probed_folders = set()
 
         if self._executor is None:
             self._executor = ThreadPoolExecutor(
@@ -179,6 +199,11 @@ class StrmNfo(_PluginBase):
             "force": self._force,
             "max_per_run": self._max_per_run,
             "notify": self._notify,
+            "probe": self._probe,
+            "probe_timeout": self._probe_timeout,
+            "probe_limit": self._probe_limit,
+            "probe_per_folder": self._probe_per_folder,
+            "filename_only": self._filename_only,
         }
 
     def get_state(self) -> bool:
@@ -238,6 +263,31 @@ class StrmNfo(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                                {"component": "VSwitch", "props": {"model": "probe", "label": "探测真实参数（ffprobe）"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                                {"component": "VSwitch", "props": {"model": "probe_per_folder", "label": "每文件夹只探测一个"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                                {"component": "VTextField", "props": {
+                                    "model": "probe_timeout", "label": "探测超时（秒）", "type": "number"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                                {"component": "VTextField", "props": {
+                                    "model": "probe_limit", "label": "单次最多探测", "type": "number"}}]},
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                                {"component": "VSwitch", "props": {"model": "filename_only", "label": "只识别文件名（不探测）"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 9}, "content": [
+                                {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
+                                    "text": "打开后完全不探测、不发任何网络请求，只读文件名生成 nfo，上面「探测真实参数」开关被忽略。适合 .strm 链接打不开、或者不想让插件访问任何服务的人；代价是 nfo 里没有真实宽高/色深/采样率/文件大小等探测字段，播放器详情里对应项会缺失。"}}]},
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             {"component": "VCol", "props": {"cols": 12}, "content": [
                                 {"component": "VTextarea", "props": {
                                     "model": "watch_paths", "label": "监控目录", "rows": 3,
@@ -272,7 +322,7 @@ class StrmNfo(_PluginBase):
                             {"component": "VCol", "props": {"cols": 12}, "content": [
                                 {"component": "VAlert", "props": {
                                     "type": "info", "variant": "tonal",
-                                    "text": "本插件只生成 .strm.nfo（写在 .strm 旁边），不访问云盘。Emby 里要先装好 STRM Probe NFO 插件（4.10.1.0+），并在它的设置里选好要处理的媒体库，Emby 下次扫描时就会把 nfo 里的媒体信息读进去，媒体播放器才能显示。文件名里没有任何技术标签的文件（如只有片名+集数）生成不了，只能留空或以后再探测。"}}]},
+                                    "text": "本插件只生成 .strm.nfo（写在 .strm 旁边）。默认只读文件名、不访问云盘；打开「探测真实参数」后会读 .strm 里的 URL，用 HTTP Range 只拉约 900KB 头部交给 ffprobe，拿到精确宽高/码率/帧率/色深/音轨等真实值，探测失败的条目自动回退文件名解析。开着「每文件夹只探测一个」时，同一文件夹（同一剧/同一部电影）每轮只探测第一个需要生成的文件，其余走文件名模式。打开「只识别文件名」时完全不探测、不发任何网络请求，上面探测相关的开关全部被忽略。Emby 里要先装好 STRM Probe NFO 插件（4.10.1.0+），并在它的设置里选好要处理的媒体库。"}}]},
                         ],
                     },
                 ],
@@ -286,6 +336,11 @@ class StrmNfo(_PluginBase):
             "force": False,
             "max_per_run": 500,
             "notify": False,
+            "probe": False,
+            "probe_timeout": 25,
+            "probe_limit": 200,
+            "probe_per_folder": True,
+            "filename_only": False,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -306,6 +361,7 @@ class StrmNfo(_PluginBase):
                 "skipped": h.get("skipped", 0),
                 "unparsed": h.get("unparsed", 0),
                 "errors": h.get("errors", 0),
+                "probed": h.get("probed", 0),
             }
             for h in history[-20:]
         ]
@@ -338,6 +394,7 @@ class StrmNfo(_PluginBase):
                                 {"title": "跳过", "key": "skipped"},
                                 {"title": "无法解析", "key": "unparsed"},
                                 {"title": "失败", "key": "errors"},
+                                {"title": "探测", "key": "probed"},
                             ],
                             "items": rows,
                             "density": "compact",
@@ -490,12 +547,15 @@ class StrmNfo(_PluginBase):
 
     def _run_batch(self, paths: List[str], trigger: str):
         """处理事件给出的路径列表（文件/目录/媒体文件都兼容）。"""
-        counts = {"scanned": 0, "generated": 0, "skipped": 0, "unparsed": 0, "errors": 0}
+        counts = {"scanned": 0, "generated": 0, "skipped": 0, "unparsed": 0,
+                  "errors": 0, "probed": 0}
+        # 每批事件重新计算“已探测文件夹”
+        self._probed_folders = set()
         for raw in paths:
             p = Path(raw)
             try:
                 if p.is_dir():
-                    found = list(p.rglob("*.strm")) + list(p.rglob("*.STRM"))
+                    found = sorted(list(p.rglob("*.strm")) + list(p.rglob("*.STRM")), key=str)
                     for f in found[: self._max_per_run]:
                         self._process_one(f, counts)
                 elif p.suffix.lower() == ".strm":
@@ -523,7 +583,10 @@ class StrmNfo(_PluginBase):
 
     def _do_scan(self, trigger: str):
         """全量扫描：扫一遍所有监控目录，增量生成（已有 nfo 的跳过）。"""
-        counts = {"scanned": 0, "generated": 0, "skipped": 0, "unparsed": 0, "errors": 0}
+        counts = {"scanned": 0, "generated": 0, "skipped": 0, "unparsed": 0,
+                  "errors": 0, "probed": 0}
+        # 每轮扫描重新计算“已探测文件夹”，保证每文件夹只探测一个
+        self._probed_folders = set()
         watch = [line.strip() for line in self._watch_paths.splitlines() if line.strip()]
         exclude = [line.strip() for line in self._exclude_paths.splitlines() if line.strip()]
         if not watch:
@@ -535,7 +598,8 @@ class StrmNfo(_PluginBase):
                 logger.warning(f"STRM媒体信息补全：监控目录不存在或不可读：{root}")
                 continue
             try:
-                files = list(root_path.rglob("*.strm")) + list(root_path.rglob("*.STRM"))
+                # 排序后处理：同一文件夹里“第一个”文件是确定的
+                files = sorted(list(root_path.rglob("*.strm")) + list(root_path.rglob("*.STRM")), key=str)
             except OSError as err:  # noqa: BLE001
                 counts["errors"] += 1
                 logger.warning(f"STRM媒体信息补全：扫描 {root} 失败：{err}")
@@ -559,21 +623,54 @@ class StrmNfo(_PluginBase):
                       f"无法解析 {counts['unparsed']}，失败 {counts['errors']}。"),
             )
 
-    def _process_one(self, strm_path: Path, counts: dict):
-        """给一个 .strm 生成 nfo，并累计计数与失败记录。"""
+    def _process_one(self, strm_path: Path, counts: dict) -> bool:
+        """给一个 .strm 生成 nfo，并累计计数与失败记录。
+
+        返回 True 表示本文件实际发起了一次探测（供“每文件夹只探测一个”
+        标记本文件夹已用掉名额）；跳过/文件名模式返回 False。
+        """
         counts["scanned"] += 1
         if generate_nfo_for_strm is None:
             counts["errors"] += 1
-            return
+            return False
         try:
-            status, info = generate_nfo_for_strm(strm_path, force=self._force)
+            # 探测名额只在真正发起探测时消耗：已有 nfo 且未开覆盖的文件
+            # 根本不会探测（generate 里直接跳过），不能先数数再跳过；
+            # 同一文件夹本轮已探测过时也不再探测。
+            nfo_path = Path(strm_path).with_suffix(".strm.nfo")
+            will_skip = (not self._force) and nfo_path.exists()
+            folder = str(Path(strm_path).parent)
+            folder_used = self._probe_per_folder and folder in self._probed_folders
+            # 已探测过的文件（nfo 里有探测扩展字段）：强制覆盖扫描时也跳过，
+            # 既不重探也不覆盖——否则会把真实值写回文件名模式。多轮扫描
+            # （定时 6 小时一次）因此能自然推进到还没探过的文件夹，而不是
+            # 每轮都重探排前面的文件夹。
+            if (self._probe and self._probe_per_folder and self._force
+                    and nfo_has_probe_fields is not None
+                    and nfo_path.exists()
+                    and nfo_has_probe_fields(nfo_path)):
+                self._probed_folders.add(folder)
+                counts["skipped"] += 1
+                return False
+            use_probe = (bool(self._probe) and not self._filename_only
+                         and not will_skip and not folder_used
+                         and counts.get("probed", 0) < self._probe_limit)
+            if use_probe:
+                counts["probed"] = counts.get("probed", 0) + 1
+                self._probed_folders.add(folder)
+            status, info = generate_nfo_for_strm(
+                strm_path, force=self._force,
+                probe=use_probe, probe_timeout=self._probe_timeout,
+            )
         except Exception as err:  # noqa: BLE001
             counts["errors"] += 1
             self._record_failure(strm_path, "error", str(err))
             logger.warning(f"STRM媒体信息补全：{strm_path} 生成失败：{err}")
-            return
+            return False
         if status == "generated":
             counts["generated"] += 1
+            if (info or {}).get("source") == "probe":
+                counts["probe_ok"] = counts.get("probe_ok", 0) + 1
         elif status == "skipped":
             counts["skipped"] += 1
         elif status == "unparsed":
@@ -584,6 +681,7 @@ class StrmNfo(_PluginBase):
             err = (info or {}).get("error", "")
             self._record_failure(strm_path, "error", err)
             logger.warning(f"STRM媒体信息补全：{strm_path} 生成失败：{err}")
+        return use_probe
 
     # ==================== 记录 ====================
 
@@ -603,6 +701,8 @@ class StrmNfo(_PluginBase):
                 "skipped": counts["skipped"],
                 "unparsed": counts["unparsed"],
                 "errors": counts["errors"],
+                "probed": counts.get("probed", 0),
+                "probe_ok": counts.get("probe_ok", 0),
             })
             self.save_data("history", history[-100:])
 
