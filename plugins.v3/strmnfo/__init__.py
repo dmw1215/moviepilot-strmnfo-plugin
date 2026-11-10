@@ -61,7 +61,7 @@ class StrmNfo(_PluginBase):
     # 插件图标
     plugin_icon = "scraper.svg"
     # 插件版本
-    plugin_version = "1.1.3"
+    plugin_version = "1.1.4"
     # 插件标签
     plugin_label = "媒体库"
     # 插件作者
@@ -348,10 +348,13 @@ class StrmNfo(_PluginBase):
         stats = self.get_data("stats") or {}
         history = self.get_data("history") or []
         failures = self.get_data("failures") or []
-        summary = (f"累计生成 {stats.get('generated', 0)} ｜ "
-                   f"跳过已有 {stats.get('skipped', 0)} ｜ "
-                   f"无法解析 {stats.get('unparsed', 0)} ｜ "
-                   f"失败 {stats.get('errors', 0)}")
+        chips = [
+            {"text": f"累计生成 {stats.get('generated', 0)}", "color": "success"},
+            {"text": f"探测 {stats.get('probed', 0)}", "color": "info"},
+            {"text": f"跳过已有 {stats.get('skipped', 0)}", "color": None},
+            {"text": f"无法解析 {stats.get('unparsed', 0)}", "color": "warning"},
+            {"text": f"失败 {stats.get('errors', 0)}", "color": "error"},
+        ]
         rows = [
             {
                 "time": h.get("time", ""),
@@ -382,37 +385,48 @@ class StrmNfo(_PluginBase):
                 "props": {"title": "STRM媒体信息补全"},
                 "content": [
                     {"component": "VCardText", "content": [
-                        {"component": "VChip", "props": {"label": True, "color": "primary"}, "text": summary},
+                        {"component": "VChip",
+                         "props": {"label": True, "variant": "tonal", **({"color": c["color"]} if c["color"] else {})},
+                         "text": c["text"]}
+                        for c in chips
                     ]},
-                    {"component": "VCardText", "content": [
-                        {"component": "VDataTable", "props": {
-                            "headers": [
-                                {"title": "时间", "key": "time"},
-                                {"title": "触发", "key": "trigger"},
-                                {"title": "扫描", "key": "scanned"},
-                                {"title": "生成", "key": "generated"},
-                                {"title": "跳过", "key": "skipped"},
-                                {"title": "无法解析", "key": "unparsed"},
-                                {"title": "失败", "key": "errors"},
-                                {"title": "探测", "key": "probed"},
-                            ],
-                            "items": rows,
-                            "density": "compact",
-                            "hover": True,
-                        }},
+                    {"component": "VCard",
+                     "props": {"title": "最近运行记录"},
+                     "content": [
+                        {"component": "VCardText", "content": [
+                            {"component": "VDataTable", "props": {
+                                "headers": [
+                                    {"title": "时间", "key": "time"},
+                                    {"title": "触发", "key": "trigger"},
+                                    {"title": "扫描", "key": "scanned"},
+                                    {"title": "生成", "key": "generated"},
+                                    {"title": "跳过", "key": "skipped"},
+                                    {"title": "无法解析", "key": "unparsed"},
+                                    {"title": "失败", "key": "errors"},
+                                    {"title": "探测", "key": "probed"},
+                                ],
+                                "items": rows,
+                                "density": "compact",
+                                "hover": True,
+                            }},
+                        ]},
                     ]},
-                    {"component": "VCardText", "content": [
-                        {"component": "VDataTable", "props": {
-                            "headers": [
-                                {"title": "无法解析/失败的文件", "key": "path"},
-                                {"title": "状态", "key": "status"},
-                                {"title": "原因", "key": "error"},
-                                {"title": "时间", "key": "time"},
-                            ],
-                            "items": fail_rows,
-                            "density": "compact",
-                            "hover": True,
-                        }},
+                    {"component": "VCard",
+                     "props": {"title": "无法解析 / 失败的文件"},
+                     "content": [
+                        {"component": "VCardText", "content": [
+                            {"component": "VDataTable", "props": {
+                                "headers": [
+                                    {"title": "无法解析/失败的文件", "key": "path"},
+                                    {"title": "状态", "key": "status"},
+                                    {"title": "原因", "key": "error"},
+                                    {"title": "时间", "key": "time"},
+                                ],
+                                "items": fail_rows,
+                                "density": "compact",
+                                "hover": True,
+                            }},
+                        ]},
                     ]},
                 ],
             },
