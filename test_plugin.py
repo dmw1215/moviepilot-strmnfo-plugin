@@ -267,7 +267,7 @@ mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 StrmNfo = mod.StrmNfo
 check("插件名", StrmNfo.plugin_name, "STRM媒体信息补全")
-check("插件版本", StrmNfo.plugin_version, "1.0.4")
+check("插件版本", StrmNfo.plugin_version, "1.1.4")
 
 plugin = StrmNfo()
 plugin.init_plugin({
@@ -282,6 +282,22 @@ form, defaults = plugin.get_form()
 check("表单默认监控目录", defaults.get("watch_paths"), "/media/Link")
 page = plugin.get_page()
 check("详情页可生成", isinstance(page, list) and len(page) == 1, True)
+# v1.1.4 详情页结构：5 枚分色芯片 + 两个带标题的分区
+_card = page[0]
+check("详情页标题", _card.get("props", {}).get("title"), "STRM媒体信息补全")
+_content = _card.get("content", [])
+_chips = _content[0].get("content", []) if _content else []
+check("详情页芯片数", len(_chips), 5)
+check("详情页芯片组件", all(c.get("component") == "VChip" for c in _chips), True)
+check("详情页芯片颜色",
+      [c.get("props", {}).get("color") for c in _chips],
+      ["success", "info", None, "warning", "error"])
+_labels = ["累计生成", "探测", "跳过已有", "无法解析", "失败"]
+check("详情页芯片文本",
+      all(c.get("text", "").startswith(l) for c, l in zip(_chips, _labels)), True)
+check("详情页分区标题",
+      [c.get("props", {}).get("title") for c in _content[1:]],
+      ["最近运行记录", "无法解析 / 失败的文件"])
 
 # ---------------- 3. 端到端扫描（临时目录 + 软链接） ----------------
 print("== 3. 端到端扫描 ==")
@@ -301,9 +317,9 @@ with tempfile.TemporaryDirectory() as tmp:
     link_tagged = show / "一笑随歌.Fated.Hearts.S01E01.2025.2160p.WEB-DL.DDP5.1.HDR.Vivid.H.265.strm"
     os.symlink(orig, link_tagged)
     # 无法解析的干净名（目标也没有标签）
-    orig_clean = orig_dir / "180天重启计划.S01E01.strm"
+    orig_clean = orig_dir / "示例剧集.S01E01.strm"
     orig_clean.write_text("https://example.com/x.mkv", encoding="utf-8")
-    link_unparsed = show / "180天重启计划(2025).S01E01.strm"
+    link_unparsed = show / "示例剧集(2025).S01E01.strm"
     os.symlink(orig_clean, link_unparsed)
 
     plugin._watch_paths = str(root)
@@ -394,7 +410,7 @@ with tempfile.TemporaryDirectory() as tmp:
 print("== 5. package.v3.json ==")
 pkg = json.loads((Path(__file__).resolve().parent / "package.v3.json").read_text(encoding="utf-8"))
 check("清单含StrmNfo", "StrmNfo" in pkg, True)
-check("清单版本", pkg["StrmNfo"]["version"], "1.0.4")
+check("清单版本", pkg["StrmNfo"]["version"], "1.1.4")
 
 # ---------------- 7. v1.0.1 回归：死锁、stop_service、原子写入 ----------------
 print("== 7. v1.0.1 回归 ==")
@@ -439,6 +455,257 @@ plugin2.init_plugin({
 check("重初始化后启用", plugin2.get_state(), True)
 check("重初始化后线程池重建", plugin2._executor is not None, True)
 plugin2.stop_service()
+
+# ---------------- 8. v1.1.1：探测新字段 + 每文件夹只探一个 + 探测名额修复 ----------------
+print("== 8. v1.1.1 探测字段 / 每文件夹一个 / 名额修复 ==")
+from nfo import parse_probe_json, build_nfo  # noqa: E402
+
+# 8a. 探测新字段：用假 ffprobe JSON（不联网），覆盖截图里的全部信息
+fake_probe = {
+    "streams": [
+        {"index": 0, "codec_type": "video", "codec_name": "hevc",
+         "width": 3840, "height": 1504, "profile": "Main 10",
+         "pix_fmt": "yuv420p10le", "color_primaries": "bt2020",
+         "color_transfer": "smpte2084", "color_space": "bt2020nc",
+         "avg_frame_rate": "24/1", "bit_rate": "24490000",
+         "duration": "7728.0"},
+        {"index": 1, "codec_type": "audio", "codec_name": "truehd",
+         "channels": 8, "channel_layout": "7.1", "sample_rate": "48000",
+         "bit_rate": "4000000",
+         "tags": {"language": "eng", "title": "英语"},
+         "disposition": {"default": 1}},
+        {"index": 2, "codec_type": "audio", "codec_name": "eac3",
+         "channels": 6, "channel_layout": "5.1", "sample_rate": "48000",
+         "bit_rate": "768000",
+         "tags": {"language": "chi", "title": "国语"},
+         "disposition": {"default": 0}},
+        {"index": 3, "codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle",
+         "tags": {"language": "chi", "title": "简英"},
+         "disposition": {"default": 1}},
+        {"index": 4, "codec_type": "subtitle", "codec_name": "ass",
+         "tags": {"language": "chi", "title": "简体中文"},
+         "disposition": {"default": 0}},
+    ],
+    "format": {"bit_rate": "29000000", "size": "26450000000", "duration": "7728.0"},
+}
+pinfo = parse_probe_json(fake_probe)
+check("探测色彩空间", pinfo.get("colourspace"), "bt2020nc")
+check("探测基色", pinfo.get("colourprimaries"), "bt2020")
+check("探测深度", pinfo.get("bitdepth"), 10)
+check("探测精确宽高", (pinfo.get("width"), pinfo.get("height")), (3840, 1504))
+at = pinfo.get("audio_tracks") or []
+check("探测音轨数", len(at), 2)
+check("探测音轨1标题", at[0].get("title"), "英语")
+check("探测音轨1布局", at[0].get("channel_layout"), "7.1")
+check("探测音轨1默认", at[0].get("default"), True)
+check("探测音轨1采样率", at[0].get("sample_rate"), "48000")
+check("探测音轨2标题", at[1].get("title"), "国语")
+check("探测音轨2默认", at[1].get("default"), None)
+subs = pinfo.get("subtitles") or []
+check("探测字幕数", len(subs), 2)
+check("探测字幕1标题", subs[0][3], "简英")
+check("探测字幕1默认", subs[0][4], True)
+check("探测字幕1编码", subs[0][0], "hdmv_pgs_subtitle")
+pxml = build_nfo(pinfo, episode=False, extended=True)
+for frag in ["<colourspace>bt2020nc</colourspace>", "<title>英语</title>",
+             "<channellayout>7.1</channellayout>", "<title>简英</title>",
+             "<codec>hdmv_pgs_subtitle</codec>", "<samplerate>48000</samplerate>",
+             "<size>26450000000</size>"]:
+    check(f"探测nfo含 {frag}", frag in pxml, True)
+check("探测nfo默认标记只出现2次", pxml.count("<default>true</default>"), 2)
+
+# 8b. 每文件夹只探一个：2 个文件夹 × 3 集，probe 开、force 开，URL 不可达
+# （探测失败回退文件名模式，但名额照样消耗一次/文件夹）
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp) / "Link"
+    for show in ["剧A (2025)", "剧B (2025)"]:
+        d = root / show / "Season 1"
+        d.mkdir(parents=True)
+        for ep in range(1, 4):
+            (d / f"剧.S01E0{ep}.2160p.WEB-DL.H265.DDP5.1.strm").write_text(
+                "https://example.com/video.mkv", encoding="utf-8")
+    plugin._watch_paths = str(root)
+    plugin._force = True
+    plugin._probe = True
+    plugin._probe_timeout = 5
+    plugin._probe_limit = 200
+    plugin._probe_per_folder = True
+    plugin._do_scan(trigger="per-folder-test")
+    stats = plugin.get_data("stats") or {}
+    hist = plugin.get_data("history") or []
+    check("每文件夹只探一个：本轮探测2次", hist[-1].get("probed"), 2)
+    check("每文件夹只探一个：6个都生成", hist[-1].get("generated"), 6)
+    # 关掉每文件夹模式再扫一遍（force 开，全部重写）：应探测 6 次
+    plugin._probe_per_folder = False
+    plugin._do_scan(trigger="per-folder-off-test")
+    hist = plugin.get_data("history") or []
+    check("关闭每文件夹模式：本轮探测6次", hist[-1].get("probed"), 6)
+
+# 8c. 探测名额修复：已有 nfo 且不开覆盖时，跳过的文件不消耗探测名额
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp) / "Link"
+    root.mkdir(parents=True)
+    for i in range(3):
+        f = root / f"电影{i}.2160p.WEB-DL.H265.strm"
+        f.write_text("https://example.com/video.mkv", encoding="utf-8")
+    plugin._watch_paths = str(root)
+    plugin._force = False
+    plugin._probe = True
+    plugin._probe_timeout = 5
+    plugin._probe_limit = 200
+    plugin._probe_per_folder = False
+    plugin._do_scan(trigger="budget-test-1")
+    hist = plugin.get_data("history") or []
+    check("首轮3个文件都探测过", hist[-1].get("probed"), 3)
+    plugin._do_scan(trigger="budget-test-2")
+    hist = plugin.get_data("history") or []
+    check("第二轮全跳过：探测0次", hist[-1].get("probed"), 0)
+    check("第二轮全跳过：跳过3个", hist[-1].get("skipped"), 3)
+
+# 8d. 已探测过的文件不再重探：强制覆盖扫描时，带探测标记的 nfo 原样保留
+from nfo import nfo_has_probe_fields  # noqa: E402
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp) / "Link"
+    d = root / "剧C (2025)" / "Season 1"
+    d.mkdir(parents=True)
+    f1 = d / "剧.S01E01.2160p.WEB-DL.H265.DDP5.1.strm"
+    f1.write_text("https://example.com/video.mkv", encoding="utf-8")
+    f2 = d / "剧.S01E02.2160p.WEB-DL.H265.DDP5.1.strm"
+    f2.write_text("https://example.com/video.mkv", encoding="utf-8")
+    # E01 的 nfo 已是探测产物（带扩展字段），E02 的还是文件名模式
+    probed_nfo = f1.with_suffix(".strm.nfo")
+    probed_nfo.write_text(
+        "<?xml version='1.0' encoding='utf-8'?>\n<movie><fileinfo><streamdetails>"
+        "<video><codec>hevc</codec><width>3840</width><height>1608</height>"
+        "<bitdepth>10</bitdepth><colourspace>bt2020nc</colourspace></video>"
+        "</streamdetails></fileinfo></movie>", encoding="utf-8")
+    before = probed_nfo.read_bytes()
+    check("nfo_has_probe_fields 认探测标记", nfo_has_probe_fields(probed_nfo), True)
+    plugin._watch_paths = str(root)
+    plugin._force = True
+    plugin._probe = True
+    plugin._probe_timeout = 5
+    plugin._probe_limit = 200
+    plugin._probe_per_folder = True
+    plugin._do_scan(trigger="already-probed-test")
+    hist = plugin.get_data("history") or []
+    check("已探测文件夹本轮不再探测", hist[-1].get("probed"), 0)
+    check("已探测的 nfo 原样保留", probed_nfo.read_bytes(), before)
+    check("同文件夹另一集照常生成", f2.with_suffix(".strm.nfo").exists(), True)
+
+# 8e. 文件大小：_fetch_head 从响应头拿真实总量（200 与 206 两种情况）
+print("== 8e. 文件大小取响应头 ==")
+import http.server  # noqa: E402
+import re  # noqa: E402
+import socketserver  # noqa: E402
+from nfo import _fetch_head  # noqa: E402
+
+
+class _RangeHandler(http.server.BaseHTTPRequestHandler):
+    """支持 Range 的最小文件服务：带 Range 回 206 + Content-Range，
+    不带回 200 + Content-Length。"""
+
+    def do_GET(self):
+        data = (Path(self.server.base_dir) / self.path.lstrip("/")).read_bytes()
+        total = len(data)
+        m = re.match(r"bytes=(\d+)-(\d*)", self.headers.get("Range", ""))
+        if m:
+            start = int(m.group(1))
+            end = min(int(m.group(2)) if m.group(2) else total - 1, total - 1)
+            body = data[start:end + 1]
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+            self.send_header("Content-Length", str(len(body)))
+        else:
+            body = data
+            self.send_response(200)
+            self.send_header("Content-Length", str(total))
+        self.send_header("Content-Type", "application/octet-stream")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+class _PlainHandler(http.server.BaseHTTPRequestHandler):
+    """不支持 Range：忽略 Range 头，永远回 200 + 全量 Content-Length。"""
+
+    def do_GET(self):
+        data = (Path(self.server.base_dir) / self.path.lstrip("/")).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Type", "application/octet-stream")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *a):
+        pass
+
+
+def _serve(handler_cls, base_dir):
+    srv = socketserver.TCPServer(("127.0.0.1", 0), handler_cls)
+    srv.base_dir = str(base_dir)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    return srv
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    big = Path(tmp) / "big.bin"
+    big.write_bytes(os.urandom(1_200_000))  # 1.2MB > 900KB 探测头
+    total = big.stat().st_size
+    srv206 = _serve(_RangeHandler, tmp)
+    try:
+        url206 = f"http://127.0.0.1:{srv206.server_address[1]}/big.bin"
+        p, served, truncated, total_size = _fetch_head(url206)
+        check("206：截断", truncated, True)
+        check("206：只读900KB", served, 900_000)
+        check("206：总量是真实大小", total_size, total)
+        os.remove(p)
+    finally:
+        srv206.shutdown()
+    srv200 = _serve(_PlainHandler, tmp)
+    try:
+        url200 = f"http://127.0.0.1:{srv200.server_address[1]}/big.bin"
+        p, served, truncated, total_size = _fetch_head(url200)
+        check("200：截断", truncated, True)
+        check("200：只读900KB", served, 900_000)
+        check("200：总量是真实大小", total_size, total)
+        os.remove(p)
+    finally:
+        srv200.shutdown()
+
+# 8f. 只识别文件名：probe 开着也被忽略，全部走文件名模式，零探测
+print("== 8f. 只识别文件名 ==")
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp) / "Link"
+    d = root / "剧D (2025)" / "Season 1"
+    d.mkdir(parents=True)
+    f1 = d / "剧.S01E01.2160p.WEB-DL.H265.DDP5.1.strm"
+    f1.write_text("https://example.com/video.mkv", encoding="utf-8")
+    f2 = d / "剧.S01E02.2160p.WEB-DL.H265.DDP5.1.strm"
+    f2.write_text("https://example.com/video.mkv", encoding="utf-8")
+    plugin._watch_paths = str(root)
+    plugin._force = True
+    plugin._probe = True  # 探测开着
+    plugin._filename_only = True  # 但只识别文件名优先
+    plugin._probe_timeout = 5
+    plugin._probe_limit = 200
+    plugin._probe_per_folder = True
+    plugin._do_scan(trigger="filename-only-test")
+    hist = plugin.get_data("history") or []
+    check("只识别文件名：探测0次", hist[-1].get("probed"), 0)
+    check("只识别文件名：2个都生成", hist[-1].get("generated"), 2)
+    nfo1 = f1.with_suffix(".strm.nfo").read_text(encoding="utf-8")
+    check("只识别文件名：nfo 无探测字段", "<bitdepth>" in nfo1, False)
+    check("只识别文件名：nfo 有文件名宽高", "<width>3840</width>" in nfo1, True)
+    # 关掉只识别文件名再扫（force 开）：恢复探测
+    plugin._filename_only = False
+    plugin._do_scan(trigger="filename-only-off-test")
+    hist = plugin.get_data("history") or []
+    check("关掉只识别文件名：恢复探测", hist[-1].get("probed"), 1)
+    plugin._filename_only = False
 
 print()
 if failures:
